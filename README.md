@@ -12,7 +12,7 @@ Local CLI pipeline unchanged — see `CLAUDE.md` for the full pipeline documenta
 2. **Upload student list Excel** (`.xlsx`) — the school's usual format (`學號 / 姓名 / School 學校 / 住址 Address`).
 3. Pick the **seats per bus** in the sidebar (16 or 28 — your fleet; 25 is the system default).
 4. Preview shows how many students were read and per-school counts — sanity-check it.
-5. Click **🚦 規劃路線 / Plan routes**. Takes ~3–10 minutes; progress is shown. The system auto-groups students into routes, each capped at the seat count you picked (one bus per route).
+5. Click **🚦 規劃路線 / Plan routes**. Takes ~3–10 minutes. The system auto-groups students into routes, each capped at the seat count you picked (one bus per route). A live panel shows the **elapsed time, estimated time remaining, and current stage** so you know it's still working.
 6. Download the route guides:
    - **📦 下載全部 (ZIP)** — everything in one file (recommended), or
    - Individual **⬇️ PDF** per route (AM morning / PM afternoon).

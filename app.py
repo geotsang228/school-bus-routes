@@ -11,6 +11,8 @@ import io
 import os
 import sys
 import csv
+import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -43,6 +45,117 @@ if "_HAS_RUN" not in st.session_state:
 
 SCHOOLS_CSV = DATA_DIR / "schools.csv"
 UPLOADED_CSV = DATA_DIR / "students_uploaded.csv"
+
+# ---------------------------------------------------------------------------
+# Live progress — run the pipeline in a worker thread, tee its stdout, and
+# estimate remaining time from how fast it advances through the pipeline
+# stages. The pipeline prints stable stage markers, so we track phases.
+# ---------------------------------------------------------------------------
+
+# Phase key -> (progress 0-100, bilingual label shown to the colleague)
+_PHASE_META = {
+    "start":      (0,   "準備中 / Starting"),
+    "intake":     (2,   "讀取資料 / Reading data"),
+    "geocode":    (12,  "地理編碼（最花時間的一步）/ Geocoding (the slow step)"),
+    "am":         (24,  "早上接送開始 / AM trip started"),
+    "cluster_am": (30,  "AM 聚類站點 / AM grouping stops"),
+    "route_am":   (48,  "AM 路線規劃 / AM planning routes"),
+    "pdf_am":     (60,  "AM 製作 PDF / AM making PDFs"),
+    "pm":         (64,  "下午接送開始 / PM trip started"),
+    "cluster_pm": (70,  "PM 聚類站點 / PM grouping stops"),
+    "route_pm":   (85,  "PM 路線規劃 / PM planning routes"),
+    "pdf_pm":     (95,  "PM 製作 PDF / PM making PDFs"),
+    "done":       (100, "完成 / Done"),
+}
+
+
+def _classify_phase(lines):
+    """Map the collected pipeline log lines to the current phase key."""
+    phase = "start"
+    for line in lines:
+        if "[Stage 1]" in line:
+            phase = "intake"
+        elif "[Stage 2]" in line:
+            phase = "geocode"
+        elif "TRIP AM" in line:
+            phase = "am"
+        elif "TRIP PM" in line:
+            phase = "pm"
+        elif "[Stage 3]" in line:
+            phase = "cluster_am" if phase == "am" else "cluster_pm" if phase == "pm" else phase
+        elif "[Stage 4]" in line:
+            phase = "route_am" if phase in ("am", "cluster_am") else (
+                "route_pm" if phase in ("pm", "cluster_pm") else phase)
+        elif "[Stage 5]" in line:
+            phase = "pdf_am" if phase in ("am", "cluster_am", "route_am") else (
+                "pdf_pm" if phase in ("pm", "cluster_pm", "route_pm") else phase)
+        elif "Pipeline complete" in line:
+            phase = "done"
+    return phase
+
+
+def _estimate_eta(history, prog, elapsed):
+    """Seconds-to-go from recent progress rate; None if not enough data yet."""
+    if len(history) < 2 or elapsed < 30:
+        return None
+    oldest_t, oldest_p = history[0]
+    span = elapsed - oldest_t
+    if span <= 0.5:
+        return None
+    slope = (prog - oldest_p) / span          # progress points per second
+    if slope < 0.1:
+        return None                            # stuck on a long API call
+    return max(5, (100 - prog) / slope)
+
+
+def _fmt_mmss(seconds):
+    m, s = int(seconds) // 60, int(seconds) % 60
+    return f"{m:02d}:{s:02d}"
+
+
+def _fmt_eta(seconds):
+    if seconds > 900:
+        return "約 15+ 分鐘 / 15+ min"
+    if seconds < 60:
+        return f"約 {int(seconds)} 秒 / ~{int(seconds)}s"
+    return f"約 {int(seconds // 60) + 1} 分鐘 / ~{int(seconds // 60) + 1} min"
+
+
+class _Tee:
+    """Thread-safe stdout capture: buffers whole lines, safe to snapshot."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._lines = []
+        self._partial = ""
+        self.error = None
+
+    def write(self, s):
+        if not s:
+            return
+        with self._lock:
+            self._partial += s
+            while "\n" in self._partial:
+                line, self._partial = self._partial.split("\n", 1)
+                self._lines.append(line)
+
+    def flush(self):
+        pass
+
+    def snapshot(self):
+        with self._lock:
+            return list(self._lines)
+
+
+def _run_pipeline_worker(tee, *args, **kwargs):
+    old = sys.stdout
+    sys.stdout = tee
+    try:
+        pipeline.run_pipeline(*args, **kwargs)
+    except Exception as e:
+        tee.error = e
+    finally:
+        sys.stdout = old
 
 st.set_page_config(page_title="校巴路線規劃 / School Bus Route Planner", layout="wide")
 
@@ -145,22 +258,55 @@ if st.button("🚦 規劃路線 / Plan routes", disabled=run_disabled, type="pri
     st.session_state["_OUTPUT_BEFORE"] = {
         p: p.stat().st_mtime for p in OUTPUT_DIR.iterdir() if p.is_file()
     }
-    log_buf = io.StringIO()
+
+    # Run the pipeline in a background thread so the UI can update live.
+    tee = _Tee()
+    worker = threading.Thread(
+        target=_run_pipeline_worker,
+        args=(tee, str(UPLOADED_CSV), str(SCHOOLS_CSV)),
+        kwargs={"capacity": int(bus_capacity), "mode": mode},
+        daemon=True,
+    )
+    t_start = time.monotonic()
+    worker.start()
+
+    history = []
+    display_prog = 0.0
     try:
         with st.status("規劃路線中… / Planning routes…", expanded=True) as status:
-            # Capture the pipeline's print() output and stream it into the UI
-            with __import__("contextlib").redirect_stdout(log_buf):
-                pipeline.run_pipeline(
-                    str(UPLOADED_CSV), str(SCHOOLS_CSV),
-                    capacity=int(bus_capacity), mode=mode,
-                )
-            st.code(log_buf.getvalue(), language="text")
-            status.update(label="完成 / Done！",
-                          state="complete", expanded=False)
+            bar = st.progress(0.0)
+            c1, c2 = st.columns(2)
+            mel, met = c1.empty(), c2.empty()
+            cap = st.empty()
+            with st.expander("詳細進度 / Detailed log", expanded=False):
+                logbox = st.empty()
+
+            while worker.is_alive():
+                lines = tee.snapshot()
+                phase = _classify_phase(lines)
+                prog, label = _PHASE_META.get(phase, (0, "準備中 / Starting"))
+                el = time.monotonic() - t_start
+                cutoff = el - 25.0
+                history = [(t, p) for t, p in history + [(el, prog)] if t >= cutoff]
+                eta = _estimate_eta(history, prog, el)
+                display_prog += (prog - display_prog) * 0.25  # glide the bar
+
+                bar.progress(min(1.0, max(0.0, display_prog / 100.0)))
+                mel.metric("已用時間 / Elapsed", _fmt_mmss(el))
+                met.metric("預計剩餘 / ETA",
+                           _fmt_eta(eta) if eta else "仍在計算… / working")
+                cap.caption(label)
+                logbox.code("\n".join(lines[-60:]), language="text")
+                time.sleep(0.5)
+
+            worker.join()
+            if tee.error:
+                raise tee.error
+            status.update(label="完成 / Done！", state="complete", expanded=False)
     except Exception as e:
         st.session_state["_RUNNING"] = False
         st.error(f"規劃失敗 / Planning failed: {e}")
-        st.code(log_buf.getvalue(), language="text")
+        st.code("\n".join(tee.snapshot()[-60:]), language="text")
         st.stop()
     finally:
         st.session_state["_RUNNING"] = False
