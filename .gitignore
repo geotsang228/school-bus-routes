@@ -1,0 +1,19 @@
+# Secrets / keys — never commit
+scripts/.env
+.env
+
+# Real student data (PII) — never commit.
+# Everything in data/ is generated or private except the shared school list.
+data/*
+!data/schools.csv
+
+# Generated output (PDFs/HTML contain student names & phones)
+output/
+
+# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# Streamlit local
+.streamlit/secrets.toml

@@ -1,0 +1,11 @@
+# School Bus Routes — web app dependencies
+# Colleague-facing deployment runs on Streamlit Community Cloud (Linux),
+# where WeasyPrint renders the PDFs (see README.md "Apt packages").
+streamlit
+weasyprint
+openpyxl
+ortools
+pandas
+numpy
+requests
+opencc-python-reimplemented
