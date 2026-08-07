@@ -137,6 +137,9 @@ if st.button("🚦 規劃路線 / Plan routes", disabled=run_disabled, type="pri
         w.writerows(students_rows)
 
     st.session_state["_RUNNING"] = True
+    # Output folder may not exist on a fresh deploy (git doesn't ship empty
+    # dirs and output/ is gitignored) — create it before snapshotting.
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     # Snapshot pre-run output mtimes so the results panel shows exactly the
     # files this run wrote/overwrote (not stale files from an earlier run).
     st.session_state["_OUTPUT_BEFORE"] = {
