@@ -17,6 +17,7 @@ import zipfile
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 # --- AMap key bootstrap ---
 try:
@@ -32,6 +33,7 @@ import normalize_xlsx  # noqa: E402
 import pipeline  # noqa: E402
 
 SCHOOLS_CSV = DATA_DIR / "schools.csv"
+TEMP_SCHOOLS_CSV = DATA_DIR / "schools_temp.csv"
 UPLOADED_CSV = DATA_DIR / "students_uploaded.csv"
 
 # --- Session state ---
@@ -45,6 +47,8 @@ if "students_csv" not in st.session_state:
     st.session_state.students_csv = None
 if "output_before" not in st.session_state:
     st.session_state.output_before = {}
+if "student_details" not in st.session_state:
+    st.session_state.student_details = []  # for the review table
 
 STAGES = [
     ("upload",   "📤 上載 Excel"),
@@ -155,6 +159,53 @@ def _geocode_address(address):
     return None
 
 
+def _make_schools_csv(am_time, pm_time):
+    """Create a temp schools CSV with user-specified start/end times."""
+    # Read the real schools.csv for lat/lng
+    schools = {}
+    if SCHOOLS_CSV.exists():
+        for row in csv.DictReader(open(SCHOOLS_CSV, encoding="utf-8-sig")):
+            schools[row["school"]] = row
+
+    # Override times
+    for sch in schools.values():
+        sch["start_time"] = am_time  # AM arrival deadline
+        # PM uses a different column — the route solver reads start_time for AM
+        # For PM, we store end_time separately; the pipeline handles it
+
+    fieldnames = ["school", "lat", "lng", "start_time", "school_cn", "address"]
+    with open(TEMP_SCHOOLS_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(schools.values())
+    return str(TEMP_SCHOOLS_CSV)
+
+
+def _build_student_details(students_csv):
+    """Build student detail rows with geocoded pickup/dropoff info."""
+    rows = list(csv.DictReader(open(students_csv, encoding="utf-8-sig")))
+    geocoded_path = DATA_DIR / "students_geocoded.csv"
+    geo = {}
+    if geocoded_path.exists():
+        for r in csv.DictReader(open(geocoded_path, encoding="utf-8-sig")):
+            geo[r.get("student_id", "")] = r
+
+    details = []
+    for s in rows:
+        sid = s.get("student_id", "")
+        g = geo.get(sid, {})
+        details.append({
+            "student_id": sid,
+            "name": s.get("name", ""),
+            "contact_phone": s.get("contact_phone", ""),
+            "address": s.get("address", ""),
+            "pickup_lat": g.get("lat", ""),
+            "pickup_lng": g.get("lng", ""),
+            "geocode_source": g.get("geocode_source", ""),
+        })
+    return details
+
+
 # =========================================================================
 # SIDEBAR — Stage progress
 # =========================================================================
@@ -227,19 +278,19 @@ if uploaded is not None and not st.session_state.students_rows:
     st.dataframe(preview, width="stretch", hide_index=True)
 
 # =========================================================================
-# SETTINGS — below upload, always visible when data is loaded
+# SETTINGS — below upload
 # =========================================================================
 if st.session_state.students_rows:
     st.divider()
     st.subheader("⚙️ 路線設定 / Route settings")
 
+    # Row 1: Capacity + Mode
     c1, c2 = st.columns(2)
     with c1:
         bus_capacity = st.selectbox(
             "🚌 每車座位 / Seats per bus",
             options=[16, 28, 25],
             index=0,
-            help="16 座小巴 / 28 座中巴 / 25 系統預設",
         )
     with c2:
         mode = st.radio(
@@ -252,22 +303,43 @@ if st.session_state.students_rows:
             horizontal=True,
         )
 
-    # Mode descriptions
     if mode == "clustered":
         st.info(
             "🔹 **聚類站點模式**：系統將附近（**200 米內**）的學生自動分組到同一個上車點。"
-            "站點會自動匹配到最近的安全巴士站（公交站）。\n\n"
-            "**Clustered mode**: students within **200m** of each other are grouped "
-            "into shared pick-up stops. Stops are auto-matched to the nearest safe "
-            "bus/coach stop (公交站)."
+            "站點可設在任何安全的上車位置，不只限於巴士站。\n\n"
+            "**Clustered mode**: students within **200m** are grouped into shared "
+            "pick-up stops. Stops can be anywhere safe for the school bus to stop."
         )
     else:
         st.info(
-            "🔹 **每人一站模式**：每位學生有獨立的上車點，設在離家 **50 米內**。"
-            "站點會匹配到最近的公交站。\n\n"
+            "🔹 **每人一站模式**：每位學生有獨立的上車點，設在離家 **50 米內**。\n\n"
             "**Own-stop mode**: each student gets an individual pick-up stop within "
-            "**50m** of their home address, matched to the nearest bus stop."
+            "**50m** of their home address."
         )
+
+    # Row 2: Times + Driver start
+    c3, c4 = st.columns(2)
+    with c3:
+        am_start = st.time_input(
+            "🌅 AM 到校時間 / School start time (must arrive by)",
+            value=None,
+            help="校車必須在這時間前到達 / Bus must arrive before this time",
+        )
+        am_start_str = am_start.strftime("%H:%M") if am_start else "08:00"
+    with c4:
+        pm_end = st.time_input(
+            "🌇 PM 放學時間 / School end time (bus departs)",
+            value=None,
+            help="校車在這時間離開學校 / Bus leaves school at this time",
+        )
+        pm_end_str = pm_end.strftime("%H:%M") if pm_end else "15:30"
+
+    driver_start = st.text_input(
+        "🚗 司機起點 / Driver start location (Stop 1)",
+        placeholder="例如：大埔寶雅苑 / e.g. Po Nga Court, Tai Po",
+        help="填寫後此地點會成為路線的第1個站。留空則由系統自動決定。"
+             " / Becomes Stop 1 of the route. Leave blank for auto.",
+    )
 
     # Plan button
     if st.session_state.phase in ("upload", "review"):
@@ -275,7 +347,7 @@ if st.session_state.students_rows:
         btn_type = "secondary" if st.session_state.phase == "review" else "primary"
 
         if st.button(btn_label, type=btn_type):
-            # Write CSV
+            # Write student CSV
             fieldnames = ["student_id", "name", "name_en", "school", "class_year",
                           "address", "dropoff_address", "district",
                           "contact_phone", "contact_name"]
@@ -285,21 +357,76 @@ if st.session_state.students_rows:
                 w.writerows(st.session_state.students_rows)
             st.session_state.students_csv = str(UPLOADED_CSV)
 
+            # Create temp schools CSV with user-specified times
+            schools_path = _make_schools_csv(am_start_str, pm_end_str)
+
+            # Save driver start
+            if driver_start.strip():
+                start_stops_path = DATA_DIR / "start_stops.json"
+                ss = {}
+                if start_stops_path.exists():
+                    try:
+                        ss = json.load(open(start_stops_path, encoding="utf-8"))
+                    except Exception:
+                        pass
+                # Will be matched to nearest stop after planning
+                ss["_driver_start_address"] = driver_start.strip()
+                json.dump(ss, open(start_stops_path, "w", encoding="utf-8"),
+                          ensure_ascii=False)
+
             with st.spinner("⏳ 路線規劃中（約 1–3 分鐘）… / Planning routes…"):
                 import time
                 t0 = time.time()
                 pipeline.plan_routes(
-                    str(UPLOADED_CSV), str(SCHOOLS_CSV),
+                    str(UPLOADED_CSV), schools_path,
                     capacity=int(bus_capacity), mode=mode,
                 )
                 st.session_state["_plan_elapsed"] = time.time() - t0
 
+            # Match driver start to nearest stop
+            if driver_start.strip():
+                coords = _geocode_address(driver_start.strip())
+                if coords:
+                    dlat, dlng = coords
+                    for trip in ("am", "pm"):
+                        stops_path = DATA_DIR / f"stops_{trip}.csv"
+                        if stops_path.exists():
+                            all_stops = list(csv.DictReader(
+                                open(stops_path, encoding="utf-8")))
+                            nearest = _find_nearest_stop(all_stops, dlat, dlng)
+                            if nearest:
+                                manifest_path = DATA_DIR / f"route_manifest_{trip}.csv"
+                                if manifest_path.exists():
+                                    manifest = list(csv.DictReader(
+                                        open(manifest_path, encoding="utf-8-sig")))
+                                    schools = set(r.get("school", "") for r in manifest)
+                                    start_stops_path = DATA_DIR / "start_stops.json"
+                                    ss = {}
+                                    if start_stops_path.exists():
+                                        try:
+                                            ss = json.load(open(start_stops_path, encoding="utf-8"))
+                                        except Exception:
+                                            pass
+                                    for sch in schools:
+                                        if sch:
+                                            ss[sch] = nearest["stop_id"]
+                                    ss.pop("_driver_start_address", None)
+                                    json.dump(ss, open(start_stops_path, "w", encoding="utf-8"),
+                                              ensure_ascii=False)
+
+                    with st.spinner(f"🔄 從「{driver_start.strip()}」重新排序…"):
+                        pipeline.plan_routes(
+                            str(UPLOADED_CSV), schools_path,
+                            capacity=int(bus_capacity), mode=mode,
+                        )
+
             st.session_state.summary = _build_summary(str(UPLOADED_CSV))
+            st.session_state.student_details = _build_student_details(str(UPLOADED_CSV))
             st.session_state.phase = "review"
             st.rerun()
 
 # =========================================================================
-# STAGE 3: REVIEW — stops with feedback checkboxes
+# STAGE 2: REVIEW
 # =========================================================================
 if st.session_state.phase == "review" and st.session_state.summary:
     summary = st.session_state.summary
@@ -309,7 +436,21 @@ if st.session_state.phase == "review" and st.session_state.summary:
         f"{_fmt_mmss(st.session_state.get('_plan_elapsed', 0))})"
     )
 
-    # Unmatched addresses
+    # --- Student details table ---
+    if st.session_state.student_details:
+        st.subheader("👤 學生資料 / Student details")
+        details = st.session_state.student_details
+        st.dataframe(
+            [{"學生 Student": d["name"],
+              "聯絡電話 Contact": d["contact_phone"],
+              "地址 Address": d["address"],
+              "經緯度 Lat,Lng": f"{d['pickup_lat']},{d['pickup_lng']}" if d["pickup_lat"] else "—",
+              "來源 Source": d["geocode_source"]}
+             for d in details],
+            width="stretch", hide_index=True,
+        )
+
+    # --- Unmatched addresses ---
     unmatched = summary.get("unmatched", [])
     if unmatched:
         st.warning(
@@ -323,7 +464,7 @@ if st.session_state.phase == "review" and st.session_state.summary:
                 width="stretch", hide_index=True,
             )
 
-    # Route summary per trip
+    # --- Route summary per trip ---
     flagged_stops = []
     for trip_label, trip_key in [("🌅 AM 早上接送", "am"), ("🌇 PM 下午接送", "pm")]:
         routes = summary.get(trip_key)
@@ -345,19 +486,30 @@ if st.session_state.phase == "review" and st.session_state.summary:
                 f"免路費 {route.get('tollfree_duration', '?')}"
             )
 
-            # Stop table with checkboxes
+            # Stop table with checkboxes + student names
+            # Build student→stop mapping from students_with_stops CSV
+            sws_path = DATA_DIR / f"students_with_stops_{trip_key}.csv"
+            stop_students_map = {}
+            if sws_path.exists():
+                for r in csv.DictReader(open(sws_path, encoding="utf-8-sig")):
+                    sid = r.get("stop_id", "")
+                    if sid not in stop_students_map:
+                        stop_students_map[sid] = []
+                    stop_students_map[sid].append(r.get("name", ""))
+
             for idx, s in enumerate(route["stops"]):
                 stop_label = s.get("label", s["stop_id"])
                 stop_addr = s.get("address", "")
                 stop_time = s.get("pickup_time", "")
                 stop_students = s.get("students_at_stop", "?")
+                student_names = stop_students_map.get(s["stop_id"], [])
 
                 col_check, col_info = st.columns([1, 8])
                 with col_check:
                     flagged = st.checkbox(
                         "⚠️",
                         key=f"flag_{trip_key}_{rn}_{s['stop_id']}",
-                        help=f"標記此站點需要修改 / Flag this stop for changes",
+                        help="標記此站點需要修改 / Flag this stop for changes",
                     )
                 with col_info:
                     st.markdown(
@@ -366,6 +518,8 @@ if st.session_state.phase == "review" and st.session_state.summary:
                     )
                     if stop_addr:
                         st.caption(f"📍 {stop_addr}")
+                    if student_names:
+                        st.caption(f"👤 {', '.join(student_names)}")
 
                 if flagged:
                     new_addr = st.text_input(
@@ -383,21 +537,13 @@ if st.session_state.phase == "review" and st.session_state.summary:
 
             st.divider()
 
-    # Show flagged summary
+    # --- Flagged stops summary ---
     if flagged_stops:
         st.warning(
             f"⚠️ 已標記 {len(flagged_stops)} 個站點 / "
-            f"{len(flagged_stops)} stops flagged for changes"
+            f"{len(flagged_stops)} stops flagged"
         )
-        with st.expander("查看標記的站點 / View flagged stops"):
-            for fs in flagged_stops:
-                st.write(
-                    f"- **{fs['label']}** ({fs['trip'].upper()} Route {fs['route']})"
-                    + (f" → 建議改到: {fs['suggested_address']}" if fs['suggested_address'] else "")
-                )
-
         if st.button("📝 儲存標記並重新規劃 / Save flags & re-plan", type="secondary"):
-            # Save flagged stops to manual_locations.csv for next run
             manual_path = DATA_DIR / "manual_locations.csv"
             existing = []
             if manual_path.exists():
@@ -405,7 +551,6 @@ if st.session_state.phase == "review" and st.session_state.summary:
                     existing = list(csv.DictReader(open(manual_path, encoding="utf-8-sig")))
                 except Exception:
                     pass
-
             existing_ids = {r.get("stop_id", "") for r in existing}
             for fs in flagged_stops:
                 if fs["suggested_address"] and fs["stop_id"] not in existing_ids:
@@ -414,69 +559,14 @@ if st.session_state.phase == "review" and st.session_state.summary:
                         "address": fs["suggested_address"],
                         "source": "manual",
                     })
-
             if existing:
-                fieldnames = ["stop_id", "address", "source"]
                 with open(manual_path, "w", newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, fieldnames=fieldnames)
+                    w = csv.DictWriter(f, fieldnames=["stop_id", "address", "source"])
                     w.writeheader()
                     w.writerows(existing)
-
-            st.session_state.phase = "review"  # stay in review, re-plan will run
             st.rerun()
 
-    # Driver start location — ask after stops are known
-    st.subheader("🚗 司機起點 / Driver start location")
-    driver_start = st.text_input(
-        "司機從哪裡開始？路線會從最近的站點開始。 / Where does the driver start? Route begins at nearest stop.",
-        placeholder="例如：尖沙咀彌敦道 / e.g. Nathan Road, Tsim Sha Tsui",
-        key="driver_start_input",
-    )
-    if driver_start.strip():
-        if st.button("🔄 從此起點重新排序路線 / Re-order route from here", type="secondary"):
-            coords = _geocode_address(driver_start.strip())
-            if coords:
-                dlat, dlng = coords
-                # Find nearest stop across all trips
-                for trip in ("am", "pm"):
-                    stops_path = DATA_DIR / f"stops_{trip}.csv"
-                    if stops_path.exists():
-                        all_stops = list(csv.DictReader(
-                            open(stops_path, encoding="utf-8")))
-                        nearest = _find_nearest_stop(all_stops, dlat, dlng)
-                        if nearest:
-                            manifest_path = DATA_DIR / f"route_manifest_{trip}.csv"
-                            if manifest_path.exists():
-                                manifest = list(csv.DictReader(
-                                    open(manifest_path, encoding="utf-8-sig")))
-                                schools = set(r.get("school", "") for r in manifest)
-                                start_stops_path = DATA_DIR / "start_stops.json"
-                                ss = {}
-                                if start_stops_path.exists():
-                                    try:
-                                        ss = json.load(open(start_stops_path, encoding="utf-8"))
-                                    except Exception:
-                                        pass
-                                for sch in schools:
-                                    if sch:
-                                        ss[sch] = nearest["stop_id"]
-                                json.dump(ss, open(start_stops_path, "w", encoding="utf-8"),
-                                          ensure_ascii=False)
-
-                with st.spinner(f"🔄 從「{driver_start.strip()}」重新排序… / Reordering…"):
-                    pipeline.plan_routes(
-                        st.session_state.students_csv, str(SCHOOLS_CSV),
-                        capacity=int(bus_capacity), mode=mode,
-                    )
-                st.toast(f"✅ 路線已從最近站點開始")
-                st.session_state.summary = _build_summary(st.session_state.students_csv)
-                st.rerun()
-            else:
-                st.error("❌ 無法識別該地址 / Could not geocode that address")
-
-    st.divider()
-
-    # Generate button
+    # --- Generate button ---
     if st.button("📄 生成 PDF / Generate PDFs", type="primary"):
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         st.session_state.output_before = {
@@ -493,7 +583,7 @@ if st.session_state.phase == "review" and st.session_state.summary:
         st.rerun()
 
 # =========================================================================
-# STAGE 4: DOWNLOAD
+# STAGE 3: DOWNLOAD + VIEW
 # =========================================================================
 if st.session_state.phase == "download":
     st.success("✅ PDF 生成完成 / PDFs ready!")
@@ -501,16 +591,27 @@ if st.session_state.phase == "download":
     pdf_files = sorted(OUTPUT_DIR.glob("*.pdf"))
     html_files = sorted(OUTPUT_DIR.glob("*.html"))
     before = st.session_state.get("output_before", {})
-    recent = [
-        p for p in (pdf_files + html_files)
-        if p.name not in before or p.stat().st_mtime > before[p.name]
-    ]
+    recent_pdfs = [p for p in pdf_files
+                   if p.name not in before or p.stat().st_mtime > before.get(p.name, 0)]
+    recent_htmls = [p for p in html_files
+                    if p.name not in before or p.stat().st_mtime > before.get(p.name, 0)]
 
-    if recent:
-        st.header("📥 下載路線指南 / Download route guides")
+    # --- Inline PDF viewer ---
+    if recent_htmls:
+        st.header("📖 路線指南 / Route guides")
+        for f in sorted(recent_htmls, key=lambda p: p.name):
+            with st.expander(f"📄 {f.name}", expanded=False):
+                html_content = f.read_text(encoding="utf-8")
+                # Render inline — tall enough for the full document
+                components.html(html_content, height=800, scrolling=True)
+
+    # --- Download buttons ---
+    if recent_pdfs or recent_htmls:
+        st.header("📥 下載 / Download")
         st.caption("請在工作階段結束前下載 — 系統每次運行都會覆寫結果。")
+        all_recent = sorted(set(recent_pdfs + recent_htmls), key=lambda p: p.name)
         cols = st.columns(3)
-        for i, f in enumerate(sorted(set(recent), key=lambda p: p.name)):
+        for i, f in enumerate(all_recent):
             with cols[i % 3]:
                 data = f.read_bytes()
                 st.download_button(
@@ -523,7 +624,7 @@ if st.session_state.phase == "download":
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            for f in sorted(set(recent), key=lambda p: p.name):
+            for f in all_recent:
                 z.write(f, f.name)
         st.download_button(
             label="📦 下載全部 (ZIP) / Download all (ZIP)",
@@ -532,7 +633,7 @@ if st.session_state.phase == "download":
             mime="application/zip",
         )
 
-    # Manifest table
+    # --- Manifest table ---
     st.divider()
     st.header("📋 路線總覽 / Route manifest")
     for trip in ("am", "pm"):
@@ -551,11 +652,8 @@ if st.session_state.phase == "download":
                 st.dataframe(view, width="stretch", hide_index=True)
 
     if st.button("🔄 開始新一輪 / Plan another round"):
-        st.session_state.phase = "upload"
-        st.session_state.summary = None
-        st.session_state.students_rows = []
-        st.session_state.students_csv = None
-        st.session_state.output_before = {}
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
         st.rerun()
 
 st.caption("RRIFA — Re-Route It For All | Admin: see README.md")
