@@ -309,19 +309,25 @@ if st.session_state["_PHASE"] == "upload" and st.session_state["_STUDENTS_ROWS"]
         st.rerun()
 
 if st.session_state["_PHASE"] == "planning":
+    # Only start a worker if one isn't already running
+    if not st.session_state.get("_WORKER") or not st.session_state["_WORKER"].is_alive():
+        st.session_state["_RUNNING"] = True
+        tee = _Tee()
+        st.session_state["_PLAN_TEE"] = tee
+        worker = threading.Thread(
+            target=_run_plan_worker,
+            args=(tee, st.session_state["_STUDENTS_CSV"], str(SCHOOLS_CSV)),
+            kwargs={"capacity": int(bus_capacity), "mode": mode},
+            daemon=True,
+        )
+        st.session_state["_WORKER"] = worker
+        st.session_state["_T_START"] = time.monotonic()
+        worker.start()
+
     st.info("⏳ 路線規劃中（約 1–3 分鐘）… / Planning routes (~1–3 min)…")
-    tee = _Tee()
-    st.session_state["_PLAN_TEE"] = tee
-    worker = threading.Thread(
-        target=_run_plan_worker,
-        args=(tee, st.session_state["_STUDENTS_CSV"], str(SCHOOLS_CSV)),
-        kwargs={"capacity": int(bus_capacity), "mode": mode},
-        daemon=True,
-    )
-    t_start = time.monotonic()
-    worker.start()
-    elapsed = _show_progress(tee, _PLAN_PHASES, t_start, "plan")
-    worker.join()
+    tee = st.session_state["_PLAN_TEE"]
+    elapsed = _show_progress(tee, _PLAN_PHASES, st.session_state["_T_START"], "plan")
+    st.session_state["_WORKER"].join()
 
     st.session_state["_RUNNING"] = False
     st.session_state["_PLAN_ELAPSED"] = elapsed
@@ -404,25 +410,29 @@ if st.session_state["_PHASE"] == "review" and st.session_state["_SUMMARY"]:
 # PHASE 2: GENERATE PDFs (Stage 5)
 # =========================================================================
 if st.session_state["_PHASE"] == "generating":
+    # Only start a worker if one isn't already running
+    if not st.session_state.get("_WORKER") or not st.session_state["_WORKER"].is_alive():
+        st.session_state["_RUNNING"] = True
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        st.session_state["_OUTPUT_BEFORE"] = {
+            p: p.stat().st_mtime for p in OUTPUT_DIR.iterdir() if p.is_file()
+        }
+        tee = _Tee()
+        st.session_state["_PDF_TEE"] = tee
+        worker = threading.Thread(
+            target=_run_pdf_worker,
+            args=(tee, st.session_state["_STUDENTS_CSV"], str(SCHOOLS_CSV)),
+            kwargs={"capacity": int(bus_capacity), "mode": mode},
+            daemon=True,
+        )
+        st.session_state["_WORKER"] = worker
+        st.session_state["_T_START"] = time.monotonic()
+        worker.start()
+
     st.info("⏳ 生成 PDF（約 2–5 分鐘）… / Generating PDFs (~2–5 min)…")
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    st.session_state["_OUTPUT_BEFORE"] = {
-        p: p.stat().st_mtime for p in OUTPUT_DIR.iterdir() if p.is_file()
-    }
-
-    tee = _Tee()
-    st.session_state["_PDF_TEE"] = tee
-    worker = threading.Thread(
-        target=_run_pdf_worker,
-        args=(tee, st.session_state["_STUDENTS_CSV"], str(SCHOOLS_CSV)),
-        kwargs={"capacity": int(bus_capacity), "mode": mode},
-        daemon=True,
-    )
-    t_start = time.monotonic()
-    worker.start()
-    elapsed = _show_progress(tee, _PDF_PHASES, t_start, "pdf")
-    worker.join()
+    tee = st.session_state["_PDF_TEE"]
+    elapsed = _show_progress(tee, _PDF_PHASES, st.session_state["_T_START"], "pdf")
+    st.session_state["_WORKER"].join()
 
     st.session_state["_RUNNING"] = False
     st.session_state["_PDF_ELAPSED"] = elapsed
