@@ -13,6 +13,8 @@ import io
 import json
 import os
 import sys
+import threading
+import time as _time
 import zipfile
 from pathlib import Path
 
@@ -157,6 +159,38 @@ def _geocode_address(address):
     except Exception:
         pass
     return None
+
+
+def _run_with_timer(fn, label, estimate, *args, **kwargs):
+    """Run fn() in a background thread while showing an elapsed-time counter.
+
+    This keeps the Streamlit UI responsive and shows the user the app is
+    working, not hung. The timer updates every second via an st.empty().
+    """
+    result = [None]
+    error = [None]
+
+    def worker():
+        try:
+            result[0] = fn(*args, **kwargs)
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    timer = st.empty()
+    t0 = _time.time()
+    while t.is_alive():
+        elapsed = int(_time.time() - t0)
+        m, s = divmod(elapsed, 60)
+        timer.caption(f"⏱️ {m:02d}:{s:02d} / 預計 {estimate}")
+        _time.sleep(1)
+    timer.empty()
+
+    if error[0]:
+        raise error[0]
+    return result[0]
 
 
 def _make_schools_csv(am_time, pm_time):
@@ -374,14 +408,15 @@ if st.session_state.students_rows:
                 json.dump(ss, open(start_stops_path, "w", encoding="utf-8"),
                           ensure_ascii=False)
 
-            with st.spinner("⏳ 路線規劃中（約 1–3 分鐘）… / Planning routes…"):
-                import time
-                t0 = time.time()
-                pipeline.plan_routes(
-                    str(UPLOADED_CSV), schools_path,
-                    capacity=int(bus_capacity), mode=mode,
-                )
-                st.session_state["_plan_elapsed"] = time.time() - t0
+            st.subheader("⏳ 路線規劃中… / Planning routes…")
+            import time as _time_mod
+            t0 = _time_mod.time()
+            _run_with_timer(
+                pipeline.plan_routes, "规划路線", "1–3 分鐘",
+                str(UPLOADED_CSV), schools_path,
+                capacity=int(bus_capacity), mode=mode,
+            )
+            st.session_state["_plan_elapsed"] = _time_mod.time() - t0
 
             # Match driver start to nearest stop
             if driver_start.strip():
@@ -414,11 +449,11 @@ if st.session_state.students_rows:
                                     json.dump(ss, open(start_stops_path, "w", encoding="utf-8"),
                                               ensure_ascii=False)
 
-                    with st.spinner(f"🔄 從「{driver_start.strip()}」重新排序…"):
-                        pipeline.plan_routes(
-                            str(UPLOADED_CSV), schools_path,
-                            capacity=int(bus_capacity), mode=mode,
-                        )
+                    _run_with_timer(
+                        pipeline.plan_routes, "重新排序", "1 分鐘",
+                        str(UPLOADED_CSV), schools_path,
+                        capacity=int(bus_capacity), mode=mode,
+                    )
 
             st.session_state.summary = _build_summary(str(UPLOADED_CSV))
             st.session_state.student_details = _build_student_details(str(UPLOADED_CSV))
@@ -573,11 +608,12 @@ if st.session_state.phase == "review" and st.session_state.summary:
             p: p.stat().st_mtime for p in OUTPUT_DIR.iterdir() if p.is_file()
         }
 
-        with st.spinner("⏳ 生成 PDF（約 2–5 分鐘）… / Generating PDFs…"):
-            pipeline.generate_outputs(
-                st.session_state.students_csv, str(SCHOOLS_CSV),
-                capacity=int(bus_capacity), mode=mode,
-            )
+        st.subheader("⏳ 生成 PDF 中… / Generating PDFs…")
+        _run_with_timer(
+            pipeline.generate_outputs, "生成 PDF", "2–5 分鐘",
+            st.session_state.students_csv, str(SCHOOLS_CSV),
+            capacity=int(bus_capacity), mode=mode,
+        )
 
         st.session_state.phase = "download"
         st.rerun()
