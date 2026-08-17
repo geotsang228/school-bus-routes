@@ -17,3 +17,4 @@ __pycache__/
 
 # Streamlit local
 .streamlit/secrets.toml
+data/manual_locations.csv
