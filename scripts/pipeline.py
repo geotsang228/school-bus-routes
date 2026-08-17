@@ -24,23 +24,26 @@ from route    import solve_all_schools
 from make_pdfs import generate_all_pdfs
 
 
-def run_pipeline(students_csv, schools_csv=None, capacity=DEFAULT_BUS_CAPACITY, mode="clustered"):
-    print("=" * 60)
-    print("School Bus Route Planner — Pipeline Run")
-    print("=" * 60)
-
-    t0 = time.time()
-
-    # Optional driver-specified start stop per school: {"<school>": "<stop_id>"}
+def _load_start_stops():
+    """Load optional driver-specified start stops per school."""
     import json as _json
-    start_stops = {}
     _ss = DATA_DIR / "start_stops.json"
     if _ss.exists():
         try:
-            start_stops = _json.load(open(_ss, encoding="utf-8"))
-            print(f"  Start stops: {start_stops}")
+            return _json.load(open(_ss, encoding="utf-8"))
         except Exception:
-            start_stops = {}
+            pass
+    return {}
+
+
+def plan_routes(students_csv, schools_csv=None, capacity=DEFAULT_BUS_CAPACITY, mode="clustered"):
+    """Run Stages 1–4: geocode, cluster, route. Returns summary dict for the review UI."""
+    print("=" * 60)
+    print("School Bus Route Planner — Phase 1: Plan Routes")
+    print("=" * 60)
+
+    t0 = time.time()
+    start_stops = _load_start_stops()
 
     # Stage 1: Intake & normalise
     print("\n[Stage 1] Data intake & normalisation")
@@ -62,7 +65,7 @@ def run_pipeline(students_csv, schools_csv=None, capacity=DEFAULT_BUS_CAPACITY, 
     geocode_students(Path(students_csv), geocoded_csv)
     print(f"  Output: {geocoded_csv}")
 
-    # Stages 3-5: cluster + route + PDF for BOTH trips (AM pickup→school, PM school→dropoff)
+    # Stages 3–4: cluster + route for BOTH trips (AM pickup→school, PM school→dropoff)
     for trip in ("am", "pm"):
         suffix = trip.upper()
         print(f"\n{'='*30} TRIP {suffix} {'='*30}")
@@ -84,16 +87,92 @@ def run_pipeline(students_csv, schools_csv=None, capacity=DEFAULT_BUS_CAPACITY, 
             total = sum(int(s["students"]) for r in routes for s in r)
             print(f"  {school}: {len(routes)} routes, {total} students")
 
-        # Stage 5: PDF generation
+    elapsed = time.time() - t0
+    print(f"\nRoute planning complete in {elapsed:.1f}s")
+
+    # Build summary for the review UI
+    return _build_route_summary(students_csv)
+
+
+def generate_outputs(students_csv, schools_csv=None, capacity=DEFAULT_BUS_CAPACITY, mode="clustered"):
+    """Run Stage 5 only: generate maps + PDFs from the route data already in data/."""
+    print("=" * 60)
+    print("School Bus Route Planner — Phase 2: Generate PDFs")
+    print("=" * 60)
+
+    t0 = time.time()
+    for trip in ("am", "pm"):
+        suffix = trip.upper()
+        print(f"\n{'='*30} TRIP {suffix} {'='*30}")
         print("\n[Stage 5] Generating PDF route guides")
         manifest_csv = str(DATA_DIR / f"route_manifest_{trip}.csv")
+        students_with_stops = str(DATA_DIR / f"students_with_stops_{trip}.csv")
         generate_all_pdfs(manifest_csv, students_with_stops, trip=trip)
 
     elapsed = time.time() - t0
-    print(f"\n{'=' * 60}")
-    print(f"Pipeline complete in {elapsed:.1f}s")
+    print(f"\nPDF generation complete in {elapsed:.1f}s")
     print(f"Outputs: {OUTPUT_DIR}")
-    print(f"{'=' * 60}")
+
+
+def _build_route_summary(students_csv):
+    """Read the manifest + stops CSVs and return a structured summary for the UI."""
+    summary = {"am": None, "pm": None, "unmatched": [], "total_students": 0}
+
+    students = list(csv.DictReader(open(students_csv, encoding="utf-8-sig")))
+    summary["total_students"] = len(students)
+
+    # Check for unmatched addresses
+    unmatched_path = DATA_DIR / "unmatched_addresses.csv"
+    if unmatched_path.exists():
+        try:
+            summary["unmatched"] = list(csv.DictReader(open(unmatched_path, encoding="utf-8-sig")))
+        except Exception:
+            pass
+
+    for trip in ("am", "pm"):
+        manifest_path = DATA_DIR / f"route_manifest_{trip}.csv"
+        stops_path = DATA_DIR / f"stops_{trip}.csv"
+        if not manifest_path.exists():
+            continue
+
+        manifest = list(csv.DictReader(open(manifest_path, encoding="utf-8-sig")))
+        stops = {}
+        if stops_path.exists():
+            for s in csv.DictReader(open(stops_path, encoding="utf-8")):
+                stops[s["stop_id"]] = s.get("label", "") or s.get("name", "")
+
+        # Group manifest rows by route
+        routes = {}
+        for row in manifest:
+            rn = row.get("route_number", "?")
+            if rn not in routes:
+                routes[rn] = {
+                    "route_number": rn,
+                    "school": row.get("school", ""),
+                    "stops": [],
+                    "fastest_duration": row.get("fastest_duration", ""),
+                    "fastest_distance_m": row.get("fastest_distance_m", ""),
+                    "fastest_tolls": row.get("fastest_tolls", ""),
+                    "tollfree_duration": row.get("tollfree_duration", ""),
+                    "tollfree_distance_m": row.get("tollfree_distance_m", ""),
+                    "tollfree_tolls": row.get("tollfree_tolls", ""),
+                }
+            routes[rn]["stops"].append({
+                "stop_id": row.get("stop_id", ""),
+                "label": stops.get(row.get("stop_id", ""), row.get("stop_id", "")),
+                "pickup_time": row.get("pickup_time", ""),
+                "students_at_stop": row.get("students_at_stop", ""),
+            })
+
+        summary[trip] = list(routes.values())
+
+    return summary
+
+
+def run_pipeline(students_csv, schools_csv=None, capacity=DEFAULT_BUS_CAPACITY, mode="clustered"):
+    """Run the full pipeline (Stages 1–5). Kept for CLI backward compatibility."""
+    plan_routes(students_csv, schools_csv, capacity, mode)
+    generate_outputs(students_csv, schools_csv, capacity, mode)
 
 
 if __name__ == "__main__":

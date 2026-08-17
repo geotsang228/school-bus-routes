@@ -1,16 +1,17 @@
 """
-School Bus Routes — Streamlit web app for non-technical colleagues.
+RRIFA — Re-Route It For All
+School Bus Route Planner — Streamlit web app for non-technical colleagues.
 
 Usage (local):  streamlit run app.py
 Usage (cloud):  deploy on Streamlit Community Cloud — see README.md
 
-Flow:  upload Excel student list → preview → run pipeline → download PDFs.
+Flow:  upload Excel → plan routes (fast) → review → generate PDFs (slow) → download.
 Bilingual Traditional Chinese / English.
 """
+import csv
 import io
 import os
 import sys
-import csv
 import threading
 import time
 import zipfile
@@ -19,8 +20,6 @@ from pathlib import Path
 import streamlit as st
 
 # --- AMap key bootstrap: must happen before `config` is imported ---
-# On Streamlit Cloud the key lives in Streamlit Secrets; locally it can
-# also be set via env var or scripts/.env (config.py falls back to those).
 try:
     os.environ.setdefault("AMAP_KEY", st.secrets["amap_key"])
 except Exception:
@@ -34,43 +33,53 @@ from config import DATA_DIR, OUTPUT_DIR  # noqa: E402
 import normalize_xlsx  # noqa: E402
 import pipeline  # noqa: E402
 
-# Single-process concurrency guard: AMap free-tier throttles bursts, and two
-# colleagues clicking Run at once would double-fire the pipeline.
-if "_RUNNING" not in st.session_state:
-    st.session_state["_RUNNING"] = False
-# Set True after a successful pipeline run in THIS session, so stale PDFs
-# from an earlier run/colleague are never shown as this user's results.
-if "_HAS_RUN" not in st.session_state:
-    st.session_state["_HAS_RUN"] = False
+# --- Session state defaults ---
+_defaults = {
+    "_PHASE": "upload",          # upload | planning | review | generating | done
+    "_RUNNING": False,           # any background worker active
+    "_SUMMARY": None,            # route summary dict from plan_routes()
+    "_STUDENTS_ROWS": [],        # parsed student rows from uploaded Excel
+    "_STUDENTS_CSV": None,       # path to the written CSV
+    "_OUTPUT_BEFORE": {},        # snapshot of output/ mtimes before PDF gen
+    "_PLAN_TEE": None,           # _Tee for Phase 1 stdout
+    "_PDF_TEE": None,            # _Tee for Phase 2 stdout
+    "_PLAN_ELAPSED": 0,          # Phase 1 elapsed seconds
+    "_PDF_ELAPSED": 0,           # Phase 2 elapsed seconds
+}
+for k, v in _defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 SCHOOLS_CSV = DATA_DIR / "schools.csv"
 UPLOADED_CSV = DATA_DIR / "students_uploaded.csv"
 
 # ---------------------------------------------------------------------------
-# Live progress — run the pipeline in a worker thread, tee its stdout, and
-# estimate remaining time from how fast it advances through the pipeline
-# stages. The pipeline prints stable stage markers, so we track phases.
+# Progress helpers
 # ---------------------------------------------------------------------------
 
-# Phase key -> (progress 0-100, bilingual label shown to the colleague)
-_PHASE_META = {
+# Phase key -> (progress 0–100, bilingual label)
+_PLAN_PHASES = {
     "start":      (0,   "準備中 / Starting"),
     "intake":     (2,   "讀取資料 / Reading data"),
-    "geocode":    (12,  "地理編碼（最花時間的一步）/ Geocoding (the slow step)"),
-    "am":         (24,  "早上接送開始 / AM trip started"),
-    "cluster_am": (30,  "AM 聚類站點 / AM grouping stops"),
-    "route_am":   (48,  "AM 路線規劃 / AM planning routes"),
-    "pdf_am":     (60,  "AM 製作 PDF / AM making PDFs"),
-    "pm":         (64,  "下午接送開始 / PM trip started"),
-    "cluster_pm": (70,  "PM 聚類站點 / PM grouping stops"),
-    "route_pm":   (85,  "PM 路線規劃 / PM planning routes"),
-    "pdf_pm":     (95,  "PM 製作 PDF / PM making PDFs"),
-    "done":       (100, "完成 / Done"),
+    "geocode":    (12,  "地理編碼 / Geocoding"),
+    "am":         (24,  "AM 路線規劃 / AM routing"),
+    "cluster_am": (30,  "AM 聚類站點 / AM stops"),
+    "route_am":   (48,  "AM 路線計算 / AM routes"),
+    "pm":         (60,  "PM 路線規劃 / PM routing"),
+    "cluster_pm": (68,  "PM 聚類站點 / PM stops"),
+    "route_pm":   (85,  "PM 路線計算 / PM routes"),
+    "done":       (100, "路線規劃完成 / Routes planned"),
+}
+
+_PDF_PHASES = {
+    "start":  (0,   "準備中 / Starting"),
+    "pdf_am": (30,  "AM 製作 PDF / AM PDFs"),
+    "pdf_pm": (70,  "PM 製作 PDF / PM PDFs"),
+    "done":   (100, "PDF 完成 / PDFs done"),
 }
 
 
-def _classify_phase(lines):
-    """Map the collected pipeline log lines to the current phase key."""
+def _classify_phase(lines, phase_map):
     phase = "start"
     for line in lines:
         if "[Stage 1]" in line:
@@ -87,24 +96,24 @@ def _classify_phase(lines):
             phase = "route_am" if phase in ("am", "cluster_am") else (
                 "route_pm" if phase in ("pm", "cluster_pm") else phase)
         elif "[Stage 5]" in line:
-            phase = "pdf_am" if phase in ("am", "cluster_am", "route_am") else (
-                "pdf_pm" if phase in ("pm", "cluster_pm", "route_pm") else phase)
-        elif "Pipeline complete" in line:
+            phase = "pdf_am" if "pdf_am" in phase_map else "pdf_pm" if "pdf_pm" in phase_map else phase
+            if phase not in phase_map:
+                phase = "pdf_am" if phase in ("am", "cluster_am", "route_am") else "pdf_pm"
+        elif "Pipeline complete" in line or "complete in" in line:
             phase = "done"
     return phase
 
 
 def _estimate_eta(history, prog, elapsed):
-    """Seconds-to-go from recent progress rate; None if not enough data yet."""
-    if len(history) < 2 or elapsed < 30:
+    if len(history) < 2 or elapsed < 15:
         return None
     oldest_t, oldest_p = history[0]
     span = elapsed - oldest_t
     if span <= 0.5:
         return None
-    slope = (prog - oldest_p) / span          # progress points per second
+    slope = (prog - oldest_p) / span
     if slope < 0.1:
-        return None                            # stuck on a long API call
+        return None
     return max(5, (100 - prog) / slope)
 
 
@@ -122,7 +131,7 @@ def _fmt_eta(seconds):
 
 
 class _Tee:
-    """Thread-safe stdout capture: buffers whole lines, safe to snapshot."""
+    """Thread-safe stdout capture."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -147,26 +156,79 @@ class _Tee:
             return list(self._lines)
 
 
-def _run_pipeline_worker(tee, *args, **kwargs):
+# ---------------------------------------------------------------------------
+# Background workers
+# ---------------------------------------------------------------------------
+
+def _run_plan_worker(tee, *args, **kwargs):
     old = sys.stdout
     sys.stdout = tee
     try:
-        pipeline.run_pipeline(*args, **kwargs)
+        result = pipeline.plan_routes(*args, **kwargs)
+        tee.result = result
     except Exception as e:
         tee.error = e
     finally:
         sys.stdout = old
 
-st.set_page_config(page_title="校巴路線規劃 / School Bus Route Planner", layout="wide")
 
-# --- Sidebar: admin controls (kept out of the main colleague flow) ---
+def _run_pdf_worker(tee, *args, **kwargs):
+    old = sys.stdout
+    sys.stdout = tee
+    try:
+        pipeline.generate_outputs(*args, **kwargs)
+    except Exception as e:
+        tee.error = e
+    finally:
+        sys.stdout = old
+
+
+def _show_progress(tee, phase_map, start_time, key_prefix):
+    """Render a live progress bar + ETA + log from a running worker thread."""
+    history = []
+    display_prog = 0.0
+    placeholder = st.empty()
+    with placeholder.container():
+        bar = st.progress(0.0)
+        c1, c2 = st.columns(2)
+        mel, met = c1.empty(), c2.empty()
+        cap = st.empty()
+        with st.expander("詳細進度 / Detailed log", expanded=False):
+            logbox = st.empty()
+
+        while st.session_state["_RUNNING"]:
+            lines = tee.snapshot()
+            phase = _classify_phase(lines, phase_map)
+            prog, label = phase_map.get(phase, (0, "準備中 / Starting"))
+            el = time.monotonic() - start_time
+            cutoff = el - 25.0
+            history = [(t, p) for t, p in history + [(el, prog)] if t >= cutoff]
+            eta = _estimate_eta(history, prog, el)
+            display_prog += (prog - display_prog) * 0.25
+
+            bar.progress(min(1.0, max(0.0, display_prog / 100.0)))
+            mel.metric("已用時間 / Elapsed", _fmt_mmss(el))
+            met.metric("預計剩餘 / ETA",
+                       _fmt_eta(eta) if eta else "仍在計算… / working")
+            cap.caption(label)
+            logbox.code("\n".join(lines[-40:]), language="text")
+            time.sleep(0.5)
+
+    return time.monotonic() - start_time
+
+
+# ---------------------------------------------------------------------------
+# Page config + layout
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="RRIFA — 校巴路線規劃", layout="wide")
+
 with st.sidebar:
     st.header("⚙️ 設定 / Settings")
     bus_capacity = st.selectbox(
         "每車座位 / Seats per bus",
         options=[16, 28, 25],
         index=0,
-        help="16 或 28 座（常用）。25 為系統預設。 / 16 or 28 seats (common). 25 = system default.",
+        help="16 或 28 座（常用）。25 為系統預設。",
     )
     mode = st.radio(
         "規劃方式 / Planning mode",
@@ -175,156 +237,212 @@ with st.sidebar:
             "clustered": "聚類站點 (Clustered stops)",
             "custom": "每個學生一站 (Each student = own stop)",
         }[m],
-        help="預設為聚類站點，與歷年做法一致。 / Default clustered stops, matching past years.",
     )
-    st.caption("管理員設定 / Admin settings")
 
-st.title("🚌 校巴路線規劃 / School Bus Route Planner")
+st.title("🚌 RRIFA — 校巴路線規劃")
+st.caption("Re-Route It For All")
 st.markdown(
-    "上載學生名單 Excel → 按「規劃路線」→ 下載路線 PDF。\n\n"
-    "Upload the student list Excel → click **Plan routes** → download the route PDFs.\n\n"
-    "*路程需時約 3–10 分鐘，請耐心等候。 / Takes ~3–10 minutes — please wait.*"
+    "上載學生名單 Excel → 預覽路線 → 確認後生成 PDF。\n\n"
+    "Upload student list → preview routes → confirm to generate PDFs."
 )
 
-# ---------------------------------------------------------------------------
-# 1. Upload
-# ---------------------------------------------------------------------------
+# =========================================================================
+# PHASE 0: UPLOAD
+# =========================================================================
 uploaded = st.file_uploader(
     "上載學生名單 Excel / Upload student list (.xlsx)",
     type=["xlsx"],
 )
 
-students_rows = []
-if uploaded is not None:
-    # Save the upload to a temp file so openpyxl can read it
+if uploaded is not None and not st.session_state["_STUDENTS_ROWS"]:
     tmp = DATA_DIR / "uploaded.xlsx"
     tmp.write_bytes(uploaded.getvalue())
     try:
         header, raw_rows = normalize_xlsx.read_xlsx(tmp)
-        students_rows = [
+        rows = [
             normalize_xlsx.to_pipeline_row(r, header) for r in raw_rows
             if normalize_xlsx.to_pipeline_row(r, header)["student_id"]
         ]
+        st.session_state["_STUDENTS_ROWS"] = rows
     except Exception as e:
         st.error(f"讀取 Excel 失敗 / Failed to read Excel: {e}")
         st.stop()
 
-    if not students_rows:
-        st.warning("Excel 內沒有有效學生紀錄 / No valid student records found in the Excel.")
+    if not rows:
+        st.warning("Excel 內沒有有效學生紀錄 / No valid student records found.")
         st.stop()
 
     schools_count = {}
-    for s in students_rows:
-        schools_count[s["school"] or "（未填學校 / no school）"] = (
-            schools_count.get(s["school"] or "（未填學校 / no school）", 0) + 1
-        )
+    for s in rows:
+        sch = s["school"] or "（未填學校 / no school）"
+        schools_count[sch] = schools_count.get(sch, 0) + 1
 
-    st.success(
-        f"讀取 {len(students_rows)} 條學生紀錄 / Loaded {len(students_rows)} student records."
-    )
+    st.success(f"✅ 讀取 {len(rows)} 條學生紀錄 / Loaded {len(rows)} student records.")
     st.caption("學校分佈 / Schools: " + ", ".join(f"{k}: {v}" for k, v in schools_count.items()))
 
-    # Show a preview so the colleague can sanity-check before the slow run
     preview = [
         {"學號 ID": s["student_id"], "姓名 Name": s["name"],
          "學校 School": s["school"], "地址 Address": s["address"]}
-        for s in students_rows
+        for s in rows
     ]
     st.dataframe(preview, width="stretch", hide_index=True)
 
-# ---------------------------------------------------------------------------
-# 2. Run
-# ---------------------------------------------------------------------------
-run_disabled = (uploaded is None) or st.session_state["_RUNNING"]
-if st.session_state["_RUNNING"]:
-    st.info("⏳ 路線規劃進行中，請稍候… / Route planning in progress, please wait…")
+# =========================================================================
+# PHASE 1: PLAN ROUTINES (Stages 1–4)
+# =========================================================================
+can_plan = (st.session_state["_STUDENTS_ROWS"] and
+            st.session_state["_PHASE"] in ("upload", "review"))
 
-if st.button("🚦 規劃路線 / Plan routes", disabled=run_disabled, type="primary"):
-    # Write the normalized CSV the pipeline expects
-    fieldnames = ["student_id", "name", "name_en", "school", "class_year",
-                  "address", "dropoff_address", "district",
-                  "contact_phone", "contact_name"]
-    with open(UPLOADED_CSV, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(students_rows)
+if st.session_state["_PHASE"] == "upload" and st.session_state["_STUDENTS_ROWS"]:
+    if st.button("🗺️ 規劃路線 / Plan routes", type="primary"):
+        # Write CSV
+        fieldnames = ["student_id", "name", "name_en", "school", "class_year",
+                      "address", "dropoff_address", "district",
+                      "contact_phone", "contact_name"]
+        with open(UPLOADED_CSV, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(st.session_state["_STUDENTS_ROWS"])
+        st.session_state["_STUDENTS_CSV"] = str(UPLOADED_CSV)
+        st.session_state["_PHASE"] = "planning"
+        st.session_state["_RUNNING"] = True
+        st.rerun()
 
-    st.session_state["_RUNNING"] = True
-    # Output folder may not exist on a fresh deploy (git doesn't ship empty
-    # dirs and output/ is gitignored) — create it before snapshotting.
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Snapshot pre-run output mtimes so the results panel shows exactly the
-    # files this run wrote/overwrote (not stale files from an earlier run).
-    st.session_state["_OUTPUT_BEFORE"] = {
-        p: p.stat().st_mtime for p in OUTPUT_DIR.iterdir() if p.is_file()
-    }
-
-    # Run the pipeline in a background thread so the UI can update live.
+if st.session_state["_PHASE"] == "planning":
+    st.info("⏳ 路線規劃中（約 1–3 分鐘）… / Planning routes (~1–3 min)…")
     tee = _Tee()
+    st.session_state["_PLAN_TEE"] = tee
     worker = threading.Thread(
-        target=_run_pipeline_worker,
-        args=(tee, str(UPLOADED_CSV), str(SCHOOLS_CSV)),
+        target=_run_plan_worker,
+        args=(tee, st.session_state["_STUDENTS_CSV"], str(SCHOOLS_CSV)),
         kwargs={"capacity": int(bus_capacity), "mode": mode},
         daemon=True,
     )
     t_start = time.monotonic()
     worker.start()
+    elapsed = _show_progress(tee, _PLAN_PHASES, t_start, "plan")
+    worker.join()
 
-    history = []
-    display_prog = 0.0
-    try:
-        with st.status("規劃路線中… / Planning routes…", expanded=True) as status:
-            bar = st.progress(0.0)
-            c1, c2 = st.columns(2)
-            mel, met = c1.empty(), c2.empty()
-            cap = st.empty()
-            with st.expander("詳細進度 / Detailed log", expanded=False):
-                logbox = st.empty()
+    st.session_state["_RUNNING"] = False
+    st.session_state["_PLAN_ELAPSED"] = elapsed
 
-            while worker.is_alive():
-                lines = tee.snapshot()
-                phase = _classify_phase(lines)
-                prog, label = _PHASE_META.get(phase, (0, "準備中 / Starting"))
-                el = time.monotonic() - t_start
-                cutoff = el - 25.0
-                history = [(t, p) for t, p in history + [(el, prog)] if t >= cutoff]
-                eta = _estimate_eta(history, prog, el)
-                display_prog += (prog - display_prog) * 0.25  # glide the bar
-
-                bar.progress(min(1.0, max(0.0, display_prog / 100.0)))
-                mel.metric("已用時間 / Elapsed", _fmt_mmss(el))
-                met.metric("預計剩餘 / ETA",
-                           _fmt_eta(eta) if eta else "仍在計算… / working")
-                cap.caption(label)
-                logbox.code("\n".join(lines[-60:]), language="text")
-                time.sleep(0.5)
-
-            worker.join()
-            if tee.error:
-                raise tee.error
-            status.update(label="完成 / Done！", state="complete", expanded=False)
-    except Exception as e:
-        st.session_state["_RUNNING"] = False
-        st.error(f"規劃失敗 / Planning failed: {e}")
+    if tee.error:
+        st.error(f"規劃失敗 / Planning failed: {tee.error}")
         st.code("\n".join(tee.snapshot()[-60:]), language="text")
-        st.stop()
-    finally:
-        st.session_state["_RUNNING"] = False
-        st.session_state["_HAS_RUN"] = True
+        st.session_state["_PHASE"] = "upload"
+    else:
+        st.session_state["_SUMMARY"] = tee.result
+        st.session_state["_PHASE"] = "review"
     st.rerun()
 
-# ---------------------------------------------------------------------------
-# 3. Results
-# ---------------------------------------------------------------------------
-pdf_files = sorted(OUTPUT_DIR.glob("*.pdf"))
-html_files = sorted(OUTPUT_DIR.glob("*.html"))
+# =========================================================================
+# PHASE 1.5: REVIEW ROUTES
+# =========================================================================
+if st.session_state["_PHASE"] == "review" and st.session_state["_SUMMARY"]:
+    summary = st.session_state["_SUMMARY"]
+    st.success(f"✅ 路線規劃完成（{_fmt_mmss(summary.get('_elapsed', st.session_state['_PLAN_ELAPSED']))}）"
+               if "_elapsed" in summary else
+               f"✅ 路線規劃完成 / Routes planned in {_fmt_mmss(st.session_state['_PLAN_ELAPSED'])}")
 
-if st.session_state["_HAS_RUN"] and (pdf_files or html_files):
+    # Unmatched addresses — show prominently
+    unmatched = summary.get("unmatched", [])
+    if unmatched:
+        st.warning(f"⚠️ {len(unmatched)} 個地址未能識別 / {len(unmatched)} addresses could not be geocoded")
+        with st.expander("查看未識別地址 / View unmatched addresses", expanded=True):
+            st.dataframe(
+                [{"學生 Student": r.get("name", ""), "地址 Address": r.get("address", "")}
+                 for r in unmatched],
+                width="stretch", hide_index=True,
+            )
+
+    # Route summary per trip
+    for trip_label, trip_key in [("🌅 AM 早上接送", "am"), ("🌇 PM 下午接送", "pm")]:
+        routes = summary.get(trip_key)
+        if not routes:
+            continue
+        st.subheader(trip_label)
+        for route in routes:
+            rn = route["route_number"]
+            n_stops = len(route["stops"])
+            n_students = sum(int(s.get("students_at_stop", 0)) for s in route["stops"])
+            fastest_t = route.get("fastest_duration", "?")
+            fastest_d = route.get("fastest_distance_m", "?")
+            tollfree_t = route.get("tollfree_duration", "?")
+            tollfree_d = route.get("tollfree_distance_m", "?")
+
+            with st.expander(
+                f"🚐 Route {rn} — {route.get('school', '')} "
+                f"({n_students} students, {n_stops} stops)"
+            ):
+                c1, c2, c3 = st.columns(3)
+                c1.metric("最快 / Fastest", fastest_t, f"{fastest_d}m")
+                c2.metric("免路費 / Toll-free", tollfree_t, f"{fastest_d}m")
+                c3.metric("學生 / Students", n_students)
+
+                stop_rows = [
+                    {"站點 Stop": s["label"], "時間 Time": s["pickup_time"],
+                     "學生 Students": s["students_at_stop"]}
+                    for s in route["stops"]
+                ]
+                st.dataframe(stop_rows, width="stretch", hide_index=True)
+
+    # Action buttons
     st.divider()
-    st.header("📥 下載路線指南 / Download route guides")
-    st.caption("請在工作階段結束前下載 — 系統每次運行都會覆寫結果。 / Download before you leave the page — results are overwritten each run.")
-    # Only files touched by this session's run (created new, or mtime changed
-    # vs the pre-run snapshot). Stale outputs are never shown as results.
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("✏️ 重新規劃 / Re-plan (change settings)", type="secondary"):
+            st.session_state["_PHASE"] = "upload"
+            st.session_state["_SUMMARY"] = None
+            st.rerun()
+    with c2:
+        if st.button("📄 生成 PDF / Generate PDFs", type="primary"):
+            st.session_state["_PHASE"] = "generating"
+            st.session_state["_RUNNING"] = True
+            st.rerun()
+
+# =========================================================================
+# PHASE 2: GENERATE PDFs (Stage 5)
+# =========================================================================
+if st.session_state["_PHASE"] == "generating":
+    st.info("⏳ 生成 PDF（約 2–5 分鐘）… / Generating PDFs (~2–5 min)…")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    st.session_state["_OUTPUT_BEFORE"] = {
+        p: p.stat().st_mtime for p in OUTPUT_DIR.iterdir() if p.is_file()
+    }
+
+    tee = _Tee()
+    st.session_state["_PDF_TEE"] = tee
+    worker = threading.Thread(
+        target=_run_pdf_worker,
+        args=(tee, st.session_state["_STUDENTS_CSV"], str(SCHOOLS_CSV)),
+        kwargs={"capacity": int(bus_capacity), "mode": mode},
+        daemon=True,
+    )
+    t_start = time.monotonic()
+    worker.start()
+    elapsed = _show_progress(tee, _PDF_PHASES, t_start, "pdf")
+    worker.join()
+
+    st.session_state["_RUNNING"] = False
+    st.session_state["_PDF_ELAPSED"] = elapsed
+
+    if tee.error:
+        st.error(f"PDF 生成失敗 / PDF generation failed: {tee.error}")
+        st.code("\n".join(tee.snapshot()[-60:]), language="text")
+        st.session_state["_PHASE"] = "review"
+    else:
+        st.session_state["_PHASE"] = "done"
+    st.rerun()
+
+# =========================================================================
+# PHASE 3: DOWNLOAD
+# =========================================================================
+if st.session_state["_PHASE"] == "done":
+    st.success(f"✅ PDF 生成完成（{_fmt_mmss(st.session_state['_PDF_ELAPSED'])}）")
+
+    pdf_files = sorted(OUTPUT_DIR.glob("*.pdf"))
+    html_files = sorted(OUTPUT_DIR.glob("*.html"))
     before = st.session_state.get("_OUTPUT_BEFORE", {})
     recent = [
         p for p in (pdf_files + html_files)
@@ -332,6 +450,8 @@ if st.session_state["_HAS_RUN"] and (pdf_files or html_files):
     ]
 
     if recent:
+        st.header("📥 下載路線指南 / Download route guides")
+        st.caption("請在工作階段結束前下載 — 系統每次運行都會覆寫結果。")
         cols = st.columns(3)
         for i, f in enumerate(sorted(set(recent), key=lambda p: p.name)):
             with cols[i % 3]:
@@ -344,8 +464,7 @@ if st.session_state["_HAS_RUN"] and (pdf_files or html_files):
                     key=str(f),
                 )
 
-    # One-click zip of every PDF/HTML from this run
-    if recent:
+        # ZIP download
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             for f in sorted(set(recent), key=lambda p: p.name):
@@ -357,12 +476,9 @@ if st.session_state["_HAS_RUN"] and (pdf_files or html_files):
             mime="application/zip",
         )
 
-# ---------------------------------------------------------------------------
-# 4. Manifest review (inline, no download needed)
-# ---------------------------------------------------------------------------
-if st.session_state["_HAS_RUN"]:
+    # Route manifest table
     st.divider()
-    st.header("📋 路線總覽 / Route manifest overview")
+    st.header("📋 路線總覽 / Route manifest")
     for trip in ("am", "pm"):
         mp = DATA_DIR / f"route_manifest_{trip}.csv"
         if mp.exists():
@@ -376,6 +492,14 @@ if st.session_state["_HAS_RUN"]:
                 view = [{c: r.get(c, "") for c in cols_keep} for r in df_rows]
                 st.dataframe(view, width="stretch", hide_index=True)
 
-st.caption(
-    "管理員設置 / Admin setup: see README.md. AMap key 配置於 Streamlit Secrets。"
-)
+    # Start over
+    if st.button("🔄 開始新一輪 / Plan another round"):
+        for k in ("_PHASE", "_RUNNING", "_SUMMARY", "_STUDENTS_ROWS",
+                   "_STUDENTS_CSV", "_OUTPUT_BEFORE"):
+            st.session_state[k] = _defaults[k]
+        st.rerun()
+
+# =========================================================================
+# Footer
+# =========================================================================
+st.caption("RRIFA — Re-Route It For All | Admin: see README.md")
