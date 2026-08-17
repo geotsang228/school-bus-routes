@@ -187,32 +187,36 @@ def _show_progress(tee, phase_map, start_time, key_prefix):
     """Render a live progress bar + ETA + log from a running worker thread."""
     history = []
     display_prog = 0.0
-    placeholder = st.empty()
-    with placeholder.container():
-        bar = st.progress(0.0)
-        c1, c2 = st.columns(2)
-        mel, met = c1.empty(), c2.empty()
-        cap = st.empty()
-        with st.expander("詳細進度 / Detailed log", expanded=False):
-            logbox = st.empty()
+    bar = st.progress(0.0)
+    c1, c2 = st.columns(2)
+    mel, met = c1.empty(), c2.empty()
+    cap = st.empty()
+    with st.expander("詳細進度 / Detailed log", expanded=False):
+        logbox = st.empty()
 
-        while st.session_state["_RUNNING"]:
-            lines = tee.snapshot()
-            phase = _classify_phase(lines, phase_map)
-            prog, label = phase_map.get(phase, (0, "準備中 / Starting"))
-            el = time.monotonic() - start_time
-            cutoff = el - 25.0
-            history = [(t, p) for t, p in history + [(el, prog)] if t >= cutoff]
-            eta = _estimate_eta(history, prog, el)
-            display_prog += (prog - display_prog) * 0.25
+    while st.session_state["_RUNNING"]:
+        lines = tee.snapshot()
+        phase = _classify_phase(lines, phase_map)
+        prog, label = phase_map.get(phase, (0, "準備中 / Starting"))
+        el = time.monotonic() - start_time
+        cutoff = el - 25.0
+        history = [(t, p) for t, p in history + [(el, prog)] if t >= cutoff]
+        eta = _estimate_eta(history, prog, el)
+        display_prog += (prog - display_prog) * 0.25
 
-            bar.progress(min(1.0, max(0.0, display_prog / 100.0)))
-            mel.metric("已用時間 / Elapsed", _fmt_mmss(el))
-            met.metric("預計剩餘 / ETA",
-                       _fmt_eta(eta) if eta else "仍在計算… / working")
-            cap.caption(label)
-            logbox.code("\n".join(lines[-40:]), language="text")
-            time.sleep(0.5)
+        bar.progress(min(1.0, max(0.0, display_prog / 100.0)))
+        mel.metric("已用時間 / Elapsed", _fmt_mmss(el))
+        met.metric("預計剩餘 / ETA",
+                   _fmt_eta(eta) if eta else "仍在計算… / working")
+        cap.caption(label)
+        logbox.code("\n".join(lines[-40:]), language="text")
+        time.sleep(0.5)
+
+    # Clear progress UI so it doesn't block the review/download screen
+    bar.empty()
+    mel.empty()
+    met.empty()
+    cap.empty()
 
     return time.monotonic() - start_time
 
@@ -324,10 +328,11 @@ if st.session_state["_PHASE"] == "planning":
         st.session_state["_T_START"] = time.monotonic()
         worker.start()
 
-    st.info("⏳ 路線規劃中（約 1–3 分鐘）… / Planning routes (~1–3 min)…")
+    status_msg = st.info("⏳ 路線規劃中（約 1–3 分鐘）… / Planning routes (~1–3 min)…")
     tee = st.session_state["_PLAN_TEE"]
     elapsed = _show_progress(tee, _PLAN_PHASES, st.session_state["_T_START"], "plan")
     st.session_state["_WORKER"].join()
+    status_msg.empty()  # Clear the info banner
 
     st.session_state["_RUNNING"] = False
     st.session_state["_PLAN_ELAPSED"] = elapsed
@@ -429,10 +434,11 @@ if st.session_state["_PHASE"] == "generating":
         st.session_state["_T_START"] = time.monotonic()
         worker.start()
 
-    st.info("⏳ 生成 PDF（約 2–5 分鐘）… / Generating PDFs (~2–5 min)…")
+    status_msg = st.info("⏳ 生成 PDF（約 2–5 分鐘）… / Generating PDFs (~2–5 min)…")
     tee = st.session_state["_PDF_TEE"]
     elapsed = _show_progress(tee, _PDF_PHASES, st.session_state["_T_START"], "pdf")
     st.session_state["_WORKER"].join()
+    status_msg.empty()  # Clear the info banner
 
     st.session_state["_RUNNING"] = False
     st.session_state["_PDF_ELAPSED"] = elapsed
