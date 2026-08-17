@@ -31,20 +31,73 @@ def _mock_location(district=""):
     )
 
 
+def _strip_floor_unit(address):
+    """Strip floor/unit suffixes for cleaner AMap queries.
+    '馬鞍山海濤居18樓04室' → '馬鞍山海濤居'
+    '大圍金獅花園39樓07室' → '大圍金獅花園'
+    """
+    import re
+    a = address
+    a = re.sub(r'\d+樓\d*室?', '', a)     # 18樓04室 → (empty)
+    a = re.sub(r'\d+樓', '', a)            # 18樓 → (empty)
+    a = re.sub(r'\d+室', '', a)            # 04室 → (empty)
+    a = a.strip()
+    return a if len(a) >= 3 else address   # don't return too-short strings
+
+
+# HK district names that appear as address prefixes — AMap already gets
+# these from the `city` param, so they're redundant and confuse it.
+_HK_DISTRICTS = [
+    "馬鞍山", "沙田", "大圍", "荃灣", "屯門", "元朗", "九龍城",
+    "旺角", "深水埗", "黃大仙", "紅磡", "九龍塘", "何文田",
+    "葵青", "青衣", "將軍澳", "藍田", "觀塘", "牛頭角",
+    "西貢", "坑口", "寶琳", "東涌", "愉景灣",
+]
+
+
+def _strip_district(address):
+    """Strip leading HK district name — it's redundant with city= param.
+    '馬鞍山海濤居' → '海濤居'
+    '大圍金獅花園' → '金獅花園'
+    """
+    for d in _HK_DISTRICTS:
+        if address.startswith(d) and len(address) > len(d):
+            return address[len(d):]
+    return address
+
+
 def _geocode_amap(address, district=""):
-    params = urllib.parse.urlencode({
-        "key": AMAP_KEY, "address": address, "city": district or "香港",
-    })
-    url = f"{AMAP_GEOCODE_URL}?{params}"
-    try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            data = json.loads(resp.read())
-        if data.get("status") == "1" and data.get("geocodes"):
-            loc = data["geocodes"][0].get("location", "")
-            lng, lat = [float(x) for x in loc.split(",")]
-            return {"lat": lat, "lng": lng, "source": "amap"}
-    except Exception:
-        pass
+    city = district or "香港"
+
+    # Build a list of address variants to try, from most to least specific
+    variants = [address]
+    stripped_fu = _strip_floor_unit(address)
+    if stripped_fu != address:
+        variants.append(stripped_fu)
+    stripped_dist = _strip_district(stripped_fu)
+    if stripped_dist != stripped_fu:
+        variants.append(stripped_dist)
+    # Last resort: just the building name without any prefix
+    if stripped_dist != address:
+        variants.append(stripped_dist)
+
+    for variant in variants:
+        params = urllib.parse.urlencode({
+            "key": AMAP_KEY, "address": variant, "city": city,
+        })
+        url = f"{AMAP_GEOCODE_URL}?{params}"
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read())
+            if data.get("status") == "1" and data.get("geocodes"):
+                loc = data["geocodes"][0].get("location", "")
+                lng, lat = [float(x) for x in loc.split(",")]
+                if _in_hk(lat, lng):
+                    return {"lat": lat, "lng": lng, "source": "amap"}
+        except Exception:
+            pass
+        time.sleep(0.3)  # pace AMap calls
+
     return None
 
 
