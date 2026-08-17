@@ -187,37 +187,36 @@ def _show_progress(tee, phase_map, start_time, key_prefix):
     """Render a live progress bar + ETA + log from a running worker thread."""
     history = []
     display_prog = 0.0
-    bar = st.progress(0.0)
-    c1, c2 = st.columns(2)
-    mel, met = c1.empty(), c2.empty()
-    cap = st.empty()
-    with st.expander("詳細進度 / Detailed log", expanded=False):
-        logbox = st.empty()
+    ui = st.container()
+    with ui:
+        bar = st.progress(0.0)
+        c1, c2 = st.columns(2)
+        mel, met = c1.empty(), c2.empty()
+        cap = st.empty()
+        with st.expander("詳細進度 / Detailed log", expanded=False):
+            logbox = st.empty()
 
     while st.session_state["_RUNNING"]:
-        lines = tee.snapshot()
-        phase = _classify_phase(lines, phase_map)
-        prog, label = phase_map.get(phase, (0, "準備中 / Starting"))
-        el = time.monotonic() - start_time
-        cutoff = el - 25.0
-        history = [(t, p) for t, p in history + [(el, prog)] if t >= cutoff]
-        eta = _estimate_eta(history, prog, el)
-        display_prog += (prog - display_prog) * 0.25
+        with ui:
+            lines = tee.snapshot()
+            phase = _classify_phase(lines, phase_map)
+            prog, label = phase_map.get(phase, (0, "準備中 / Starting"))
+            el = time.monotonic() - start_time
+            cutoff = el - 25.0
+            history = [(t, p) for t, p in history + [(el, prog)] if t >= cutoff]
+            eta = _estimate_eta(history, prog, el)
+            display_prog += (prog - display_prog) * 0.25
 
-        bar.progress(min(1.0, max(0.0, display_prog / 100.0)))
-        mel.metric("已用時間 / Elapsed", _fmt_mmss(el))
-        met.metric("預計剩餘 / ETA",
-                   _fmt_eta(eta) if eta else "仍在計算… / working")
-        cap.caption(label)
-        logbox.code("\n".join(lines[-40:]), language="text")
+            bar.progress(min(1.0, max(0.0, display_prog / 100.0)))
+            mel.metric("已用時間 / Elapsed", _fmt_mmss(el))
+            met.metric("預計剩餘 / ETA",
+                       _fmt_eta(eta) if eta else "仍在計算… / working")
+            cap.caption(label)
+            logbox.code("\n".join(lines[-40:]), language="text")
         time.sleep(0.5)
 
-    # Clear progress UI so it doesn't block the review/download screen
-    bar.empty()
-    mel.empty()
-    met.empty()
-    cap.empty()
-
+    # Clear ALL progress UI by clearing the container
+    ui.empty()
     return time.monotonic() - start_time
 
 
@@ -344,7 +343,7 @@ if st.session_state["_PHASE"] == "planning":
     else:
         st.session_state["_SUMMARY"] = tee.result
         st.session_state["_PHASE"] = "review"
-    st.rerun()
+    st.stop()  # Next interaction will render the review section
 
 # =========================================================================
 # PHASE 1.5: REVIEW ROUTES
@@ -449,7 +448,7 @@ if st.session_state["_PHASE"] == "generating":
         st.session_state["_PHASE"] = "review"
     else:
         st.session_state["_PHASE"] = "done"
-    st.rerun()
+    st.stop()  # Next interaction will render the download section
 
 # =========================================================================
 # PHASE 3: DOWNLOAD
